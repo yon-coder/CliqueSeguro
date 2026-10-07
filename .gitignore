@@ -1,4 +1,4 @@
-/cache/*
+python/cache/*
 
 #caso queira manter a pasta cache no repositório (exige a criação de um arquivo vazio chamado .gitkeep dentro dela)
 !/cache/.gitkeep

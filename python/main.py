@@ -4,13 +4,16 @@ import urllib.request
 import urllib.error
 from urllib.parse import urlparse
 import ipaddress
+from pathlib import Path
+import hashlib
 from typing import Dict, List, Set, Tuple, Any, Optional
 
 # ==============================================================================
-# CONFIGURAÇÕES CENTRAIS E CONSTANTES (Sem valores mágicos)
+# CONFIGURAÇÕES CENTRAIS E CONSTANTES
 # ==============================================================================
-CACHE_ARQUIVO = "blacklists_cache.txt"
-CACHE_EXPIRACAO_SEGUNDOS = 86400  # Cache válido por 24 horas (24 * 3600)
+BASE_DIR = Path(__file__).resolve().parent
+CACHE_DIR = BASE_DIR / "cache"
+CACHE_EXPIRACAO_SEGUNDOS = 86400  # Cache válido por 24 horas
 
 HTTP_TIMEOUT_FEEDS = 10
 HTTP_TIMEOUT_ANALISE = 5
@@ -92,82 +95,70 @@ def eh_endereco_ip(host: str) -> bool:
 # ==============================================================================
 # GESTÃO DE CACHE E BLACKLISTS ESTÁTICAS
 # ==============================================================================
-def cache_esta_valido() -> bool:
-    """Verifica a existência e o tempo de expiração do cache local."""
-    if not os.path.exists(CACHE_ARQUIVO):
-        return False
-    tempo_modificacao = os.path.getmtime(CACHE_ARQUIVO)
-    return (time.time() - tempo_modificacao) < CACHE_EXPIRACAO_SEGUNDOS
-
-
-def carregar_cache_local() -> Set[str]:
-    """Carrega as URLs salvas no arquivo de cache local."""
-    urls = set()
-    try:
-        with open(CACHE_ARQUIVO, 'r', encoding='utf-8') as f:
-            for linha in f:
-                linha_limpa = linha.strip()
-                if linha_limpa:
-                    urls.add(linha_limpa)
-        print(f"📦 Cache local carregado com sucesso! ({len(urls):,} URLs).")
-    except (OSError, UnicodeDecodeError) as e:
-        print(f"⚠️ Falha ao ler arquivo de cache: {e}")
-    return urls
-
-
-def salvar_cache_local(urls: Set[str]) -> None:
-    """Salva a base consolidada de URLs no arquivo de cache local."""
-    try:
-        with open(CACHE_ARQUIVO, 'w', encoding='utf-8') as f:
-            for url in urls:
-                f.write(f"{url}\n")
-        print("💾 Cache local atualizado com sucesso.")
-    except OSError as e:
-        print(f"⚠️ Não foi possível salvar o cache local: {e}")
-
-
-def baixar_feeds_estaticos() -> Set[str]:
-    """Faz o download dos feeds públicos de URLs maliciosas."""
-    print("⏳ Baixando bases de dados atualizadas da web...")
-    urls_maliciosas = set()
-
-    for feed_url in FEEDS_AMEACAS:
-        try:
-            req = urllib.request.Request(feed_url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_FEEDS) as resposta:
-                linhas = resposta.read().decode('utf-8', errors='ignore').splitlines()
-                
-                for linha in linhas:
-                    linha_limpa = linha.strip()
-                    if linha_limpa and not linha_limpa.startswith('#'):
-                        urls_maliciosas.add(normalizar_url(linha_limpa))
-                print(f"  └─ Sucesso ao ler: {feed_url}")
-
-        except urllib.error.HTTPError as e:
-            print(f"  └─ ⚠️ Erro HTTP {e.code} ao acessar {feed_url}")
-        except urllib.error.URLError as e:
-            print(f"  └─ ⚠️ Erro de conexão ao acessar {feed_url}: {e.reason}")
-        except TimeoutError:
-            print(f"  └─ ⚠️ Tempo limite excedido ao baixar {feed_url}")
-
-    return urls_maliciosas
+def obter_caminho_cache(feed_url: str) -> Path:
+    """Gera um nome de arquivo único e seguro para o cache de cada feed."""
+    nome_arquivo = hashlib.md5(feed_url.encode()).hexdigest() + ".txt"
+    return CACHE_DIR / nome_arquivo
 
 
 def carregar_base_de_dados() -> Set[str]:
-    """Gerencia o carregamento de URLs, priorizando o cache se estiver dentro da validade."""
+    """Gerencia o download e carregamento das URLs, mantendo caches separados por feed."""
     print("⏳ [Fase 1] Verificando bases de dados estáticas (Blacklists)...")
     
-    if cache_esta_valido():
-        return carregar_cache_local()
+    # Cria a pasta cache/ automaticamente se ela não existir
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    urls_maliciosas = set()
+    tempo_atual = time.time()
 
-    print("ℹ️ Cache local ausente ou expirado.")
-    urls = baixar_feeds_estaticos()
-    
-    if urls:
-        salvar_cache_local(urls)
-    
-    print(f"✅ Base carregada! {len(urls):,} URLs conhecidas na memória.\n")
-    return urls
+    for feed_url in FEEDS_AMEACAS:
+        arquivo_cache = obter_caminho_cache(feed_url)
+        usar_cache = False
+
+        if arquivo_cache.exists():
+            tempo_modificacao = arquivo_cache.stat().st_mtime
+            if (tempo_atual - tempo_modificacao) < CACHE_EXPIRACAO_SEGUNDOS:
+                usar_cache = True
+
+        if usar_cache:
+            try:
+                with open(arquivo_cache, 'r', encoding='utf-8') as f:
+                    for linha in f:
+                        linha_limpa = linha.strip()
+                        if linha_limpa:
+                            urls_maliciosas.add(linha_limpa)
+                print(f"  └─ 📦 Carregado do cache : {feed_url}")
+            except Exception as e:
+                print(f"  └─ ⚠️ Falha ao ler cache de {feed_url}: {e}")
+        else:
+            try:
+                req = urllib.request.Request(feed_url, headers=HEADERS)
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_FEEDS) as resposta:
+                    linhas = resposta.read().decode('utf-8', errors='ignore').splitlines()
+                    
+                    urls_feed = set()
+                    for linha in linhas:
+                        linha_limpa = linha.strip()
+                        if linha_limpa and not linha_limpa.startswith('#'):
+                            url_norm = normalizar_url(linha_limpa)
+                            urls_feed.add(url_norm)
+                            urls_maliciosas.add(url_norm)
+                    
+                    with open(arquivo_cache, 'w', encoding='utf-8') as f:
+                        for u in urls_feed:
+                            f.write(f"{u}\n")
+                            
+                print(f"  └─ 🌐 Baixado e cacheado: {feed_url}")
+
+            except urllib.error.HTTPError as e:
+                print(f"  └─ ⚠️ Erro HTTP {e.code} ao acessar {feed_url}")
+            except urllib.error.URLError as e:
+                print(f"  └─ ⚠️ Erro de conexão ao acessar {feed_url}: {e.reason}")
+            except TimeoutError:
+                print(f"  └─ ⚠️ Tempo limite excedido ao baixar {feed_url}")
+
+    print(f"✅ Base carregada! {len(urls_maliciosas):,} URLs conhecidas na memória.\n")
+    return urls_maliciosas
 
 
 # ==============================================================================
