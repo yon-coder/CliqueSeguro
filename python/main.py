@@ -4,7 +4,7 @@ import json
 import socket
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import ipaddress
 from pathlib import Path
 import hashlib
@@ -13,7 +13,6 @@ from typing import Dict, List, Set, Tuple, Any, Optional
 # Gerenciamento do tldextract usando a base nativa embutida (offline)
 try:
     import tldextract
-    # Configura para usar apenas o cache/dados embutidos na biblioteca sem requisições HTTP adicionais
     extractor_offline = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
     HAS_TLDEXTRACT = True
 except ImportError:
@@ -40,9 +39,6 @@ PESO_PALAVRA_CHAVE = 5    # Indicador fraco isoladamente.
 PESO_COMBINADO = 15       # Bônus ativado apenas em acúmulo de múltiplos indicadores fracos.
 PESO_REDIR_EXTERNO = 20   # Risco maior (redirecionamento para domínios não relacionados).
 
-# Cálculo exato do Score Máximo Possível:
-# PESO_IP_DIRETO (25) + PESO_URL_LONGA (5) + PESO_HTTP (5) + PESO_PALAVRA_CHAVE (5) 
-# + PESO_COMBINADO (15) + PESO_REDIR_EXTERNO (20) = 75
 MAX_SCORE_POSSIVEL = 75
 
 LIMITE_COMPRIMENTO_URL = 75
@@ -61,94 +57,98 @@ FEEDS_AMEACAS = [
     {"nome": "ThreatFox", "url": "https://threatfox.abuse.ch/export/urls/recent/", "tipo": "json"}
 ]
 
-
 # ==============================================================================
 # FUNÇÕES DE VALIDAÇÃO, NORMALIZAÇÃO E DOMÍNIOS
 # ==============================================================================
 def eh_url_valida(url: str) -> bool:
-    """Valida rigidamente se a URL possui esquema HTTP/HTTPS, hostname válido e porta correta."""
-    if not url or not isinstance(url, str):
+    """Valida URLs HTTP(S), rejeitando entradas ambíguas ou malformadas."""
+    if not isinstance(url, str):
         return False
+
+    candidata = url.strip()
+    if not candidata or any(caractere.isspace() for caractere in candidata):
+        return False
+    if any(ord(caractere) < 32 or ord(caractere) == 127 for caractere in candidata):
+        return False
+    if "\\" in candidata:
+        return False
+
     try:
-        resultado = urlparse(url.strip())
-        if resultado.scheme not in ('http', 'https'):
+        resultado = urlparse(candidata)
+        if resultado.scheme.lower() not in ("http", "https"):
             return False
-        
         hostname = resultado.hostname
-        if not hostname:
+        if not hostname or any(caractere.isspace() for caractere in hostname):
+            return False
+        if resultado.username is not None or resultado.password is not None:
             return False
 
-        # Validação do intervalo de porta
-        if resultado.port is not None:
-            if not (1 <= resultado.port <= 65535):
+        porta = resultado.port
+        if porta is not None and not (1 <= porta <= 65535):
+            return False
+
+        if ":" in hostname:
+            try:
+                ipaddress.ip_address(hostname.split("%")[0])
+            except ValueError:
                 return False
 
         return True
-    except (ValueError, Exception):
+    except (ValueError, UnicodeError):
         return False
 
-
 def normalizar_url(url: str) -> str:
-    """
-    Padroniza esquema, hostname e caminho de forma segura:
-    - Minúsculas em Scheme e Hostname.
-    - Mantém porta explícita (se informada).
-    - Preserva Path, Query e Fragment sem alterar maiúsculas/minúsculas sensíveis.
-    """
+    """Padroniza URL para comparação; remove fragmentos que não são enviados ao servidor."""
     if not eh_url_valida(url):
         return url
     try:
         parsed = urlparse(url.strip())
         scheme = parsed.scheme.lower()
-        
-        # Mantém colchetes de IPv6 se houver
         hostname = parsed.hostname.lower() if parsed.hostname else ""
-        if ":" in hostname and not hostname.startswith('['):
+
+        if not eh_endereco_ip(hostname):
+            hostname = hostname.encode("idna").decode("ascii")
+        if ":" in hostname and not hostname.startswith("["):
             hostname = f"[{hostname}]"
 
-        port_str = f":{parsed.port}" if parsed.port and not (
-            (scheme == 'http' and parsed.port == 80) or (scheme == 'https' and parsed.port == 443)
+        porta = parsed.port
+        port_str = f":{porta}" if porta is not None and not (
+            (scheme == "http" and porta == 80) or (scheme == "https" and porta == 443)
         ) else ""
 
-        path = parsed.path
-        if path == '/':
-            path = ''
-
+        path = "" if parsed.path == "/" else parsed.path
         query = f"?{parsed.query}" if parsed.query else ""
-        fragment = f"#{parsed.fragment}" if parsed.fragment else ""
-
-        return f"{scheme}://{hostname}{port_str}{path}{query}{fragment}"
-    except Exception:
+        return f"{scheme}://{hostname}{port_str}{path}{query}"
+    except (ValueError, UnicodeError):
         return url
-
 
 def obter_dominio_registravel(hostname: str) -> str:
     """Extrai o domínio registrável usando a Public Suffix List offline."""
     if not hostname:
         return ""
-    
     host_limpo = hostname.strip('[]').lower()
 
     if eh_endereco_ip(host_limpo):
         return host_limpo
 
     if HAS_TLDEXTRACT:
-        extracted = extractor_offline(host_limpo)
-        if extracted.registered_domain:
-            return extracted.registered_domain.lower()
+        try:
+            extracted = extractor_offline(host_limpo)
+            dominio_registravel = getattr(extracted, "top_domain_under_public_suffix", "") or getattr(
+                extracted, "registered_domain", ""
+            )
+            if dominio_registravel:
+                return dominio_registravel.lower()
+        except Exception:
+            pass
 
-    # Fallback conservador se tldextract não estiver disponível
     partes = host_limpo.split('.')
     if len(partes) <= 1:
         return host_limpo
     return host_limpo
 
-
 def dominios_relacionados(dom1: str, dom2: str) -> bool:
-    """
-    Compara dois hostnames determinando se possuem o mesmo domínio registrável ou o mesmo IP.
-    Evita confundir sufixos comuns (.com.br, .co.uk).
-    """
+    """Compara dois hostnames determinando se possuem o mesmo domínio registrável ou IP."""
     if not dom1 or not dom2:
         return False
 
@@ -158,7 +158,6 @@ def dominios_relacionados(dom1: str, dom2: str) -> bool:
     if h1 == h2:
         return True
 
-    # Se ambos forem IPs, devem ser idênticos
     if eh_endereco_ip(h1) or eh_endereco_ip(h2):
         try:
             ip1 = ipaddress.ip_address(h1)
@@ -175,18 +174,16 @@ def dominios_relacionados(dom1: str, dom2: str) -> bool:
 
     return False
 
-
 def eh_endereco_ip(host: str) -> bool:
     """Valida se uma string de hostname é um IPv4 ou IPv6 válido."""
     if not host:
         return False
-    host_limpo = host.strip('[]').split('%')[0]  # Remove Scope ID do IPv6 se presente
+    host_limpo = host.strip('[]').split('%')[0]
     try:
         ipaddress.ip_address(host_limpo)
         return True
     except ValueError:
         return False
-
 
 def eh_ip_privado_ou_reservado(ip_str: str) -> bool:
     """Verifica se um IP é privado, loopback, link-local ou reservado (Proteção SSRF)."""
@@ -201,52 +198,54 @@ def eh_ip_privado_ou_reservado(ip_str: str) -> bool:
             or ip_obj.is_unspecified
         )
     except ValueError:
-        return True  # Por segurança, trata falhas de parse de IP como reservado
-
+        return True
 
 # ==============================================================================
 # GESTÃO DE CACHE E PARSERS DE FEEDS
 # ==============================================================================
 def obter_caminho_cache(feed_url: str) -> Path:
-    nome_arquivo = hashlib.md5(feed_url.encode()).hexdigest() + ".txt"
+    """Gera um nome estável compatível com os arquivos de cache das versões anteriores."""
+    nome_arquivo = hashlib.md5(feed_url.encode("utf-8")).hexdigest() + ".txt"
     return CACHE_DIR / nome_arquivo
 
-
 def processar_resposta_feed(conteudo: str, tipo_feed: str) -> Set[str]:
-    """Parseia as respostas dos feeds respeitando o formato de cada fonte (Texto ou JSON)."""
-    urls = set()
+    """Extrai URLs válidas de feeds em texto ou JSON."""
+    urls: Set[str] = set()
+    if not conteudo or not isinstance(conteudo, str):
+        return urls
+
     if tipo_feed == "json":
         try:
             dados = json.loads(conteudo)
-            if isinstance(dados, dict):
-                # Formato ThreatFox
-                for item in dados.get("urls", []):
-                    u = item.get("url") if isinstance(item, dict) else item
-                    if u and eh_url_valida(u):
-                        urls.add(normalizar_url(u))
-            elif isinstance(dados, list):
-                for item in dados:
-                    u = item.get("url") if isinstance(item, dict) else item
-                    if u and eh_url_valida(u):
-                        urls.add(normalizar_url(u))
-        except json.JSONDecodeError:
-            pass
-    else:
-        for linha in conteudo.splitlines():
-            linha_limpa = linha.strip()
-            if linha_limpa and not linha_limpa.startswith('#'):
-                if eh_url_valida(linha_limpa):
-                    urls.add(normalizar_url(linha_limpa))
+        except (json.JSONDecodeError, TypeError):
+            return urls
+        if isinstance(dados, dict):
+            itens = dados.get("urls")
+            if itens is None:
+                itens = dados.get("data", [])
+            if isinstance(itens, dict):
+                itens = list(itens.values())
+        elif isinstance(dados, list):
+            itens = dados
+        else:
+            itens = []
+        if not isinstance(itens, list):
+            return urls
+        for item in itens:
+            u = item.get("url") if isinstance(item, dict) else item
+            if isinstance(u, str) and eh_url_valida(u):
+                urls.add(normalizar_url(u))
+        return urls
+
+    for linha in conteudo.splitlines():
+        linha_limpa = linha.strip()
+        if linha_limpa and not linha_limpa.startswith("#") and eh_url_valida(linha_limpa):
+            urls.add(normalizar_url(linha_limpa))
     return urls
 
-
 def carregar_base_de_dados() -> Tuple[Dict[str, Set[str]], List[str]]:
-    """
-    Carrega as URLs de cada feed salvando em cache individual.
-    Retorna a base organizada por fonte e a lista de feeds que falharam.
-    """
+    """Carrega as URLs de cada feed salvando em cache individual."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    
     base_por_feed: Dict[str, Set[str]] = {}
     feeds_com_falha: List[str] = []
     tempo_atual = time.time()
@@ -255,14 +254,16 @@ def carregar_base_de_dados() -> Tuple[Dict[str, Set[str]], List[str]]:
         nome_feed = item_feed["nome"]
         feed_url = item_feed["url"]
         tipo_feed = item_feed["tipo"]
-        
         arquivo_cache = obter_caminho_cache(feed_url)
         urls_feed: Set[str] = set()
         usou_cache_valido = False
 
-        if arquivo_cache.exists():
-            if (tempo_atual - arquivo_cache.stat().st_mtime) < CACHE_EXPIRACAO_SEGUNDOS:
-                usou_cache_valido = True
+        try:
+            if arquivo_cache.is_file():
+                idade_cache = tempo_atual - arquivo_cache.stat().st_mtime
+                usou_cache_valido = 0 <= idade_cache < CACHE_EXPIRACAO_SEGUNDOS
+        except OSError:
+            usou_cache_valido = False
 
         if usou_cache_valido:
             try:
@@ -276,21 +277,29 @@ def carregar_base_de_dados() -> Tuple[Dict[str, Set[str]], List[str]]:
             except Exception:
                 pass
 
-        # Tenta baixar se o cache for inválido/inexistente ou falhou
         try:
             req = urllib.request.Request(feed_url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_FEEDS) as resposta:
-                conteudo = resposta.read().decode('utf-8', errors='ignore')
+                conteudo = resposta.read().decode("utf-8", errors="replace")
                 urls_feed = processar_resposta_feed(conteudo, tipo_feed)
-                
-                with open(arquivo_cache, 'w', encoding='utf-8') as f:
-                    for u in urls_feed:
-                        f.write(f"{u}\n")
+                if not urls_feed:
+                    raise ValueError("Feed vazio ou formato de resposta não reconhecido")
 
+                arquivo_temporario = arquivo_cache.with_suffix(arquivo_cache.suffix + ".tmp")
+                try:
+                    with open(arquivo_temporario, "w", encoding="utf-8") as f:
+                        for u in sorted(urls_feed):
+                            f.write(f"{u}\n")
+                    os.replace(arquivo_temporario, arquivo_cache)
+                finally:
+                    try:
+                        if arquivo_temporario.exists():
+                            arquivo_temporario.unlink()
+                    except OSError:
+                        pass
                 base_por_feed[nome_feed] = urls_feed
-
         except Exception:
-            # Em caso de falha de download, tenta ler do cache expirado como contingência
+            feeds_com_falha.append(nome_feed)
             if arquivo_cache.exists():
                 try:
                     with open(arquivo_cache, 'r', encoding='utf-8') as f:
@@ -299,42 +308,49 @@ def carregar_base_de_dados() -> Tuple[Dict[str, Set[str]], List[str]]:
                             if linha_limpa and eh_url_valida(linha_limpa):
                                 urls_feed.add(normalizar_url(linha_limpa))
                     base_por_feed[nome_feed] = urls_feed
-                except Exception:
+                except (OSError, UnicodeError):
                     base_por_feed[nome_feed] = set()
-                    feeds_com_falha.append(nome_feed)
             else:
                 base_por_feed[nome_feed] = set()
-                feeds_com_falha.append(nome_feed)
 
     return base_por_feed, feeds_com_falha
-
 
 # ==============================================================================
 # PROTEÇÃO SSRF E MOTOR DE ANÁLISE DINÂMICA
 # ==============================================================================
 def validar_ip_destino(hostname: str) -> Tuple[bool, str]:
-    """Resolve o hostname e garante que o IP de destino não seja interno/reservado."""
-    if not hostname:
+    """Bloqueia hosts cujo IP literal ou qualquer resposta DNS não seja público."""
+    if not isinstance(hostname, str) or not hostname.strip():
         return False, "Hostname ausente"
-    
-    host_limpo = hostname.strip('[]')
 
+    host_limpo = hostname.strip().strip("[]")
     if eh_endereco_ip(host_limpo):
         if eh_ip_privado_ou_reservado(host_limpo):
-            return False, f"Endereço IP público proibido ({host_limpo})"
-        return True, host_limpo
+            return False, f"Endereço IP privado/reservado bloqueado ({host_limpo})"
+        return True, "IP público válido"
 
     try:
-        # Resolve o IP via DNS
-        ips = socket.getaddrinfo(host_limpo, None)
-        for res in ips:
-            ip_resolvido = res[4][0]
-            if eh_ip_privado_ou_reservado(ip_resolvido):
-                return False, f"Resolução DNS direciona para IP privado ({ip_resolvido})"
-        return True, "IP Destino Válido"
-    except socket.gaierror:
-        return False, "Falha na resolução DNS do hostname"
+        host_dns = host_limpo.encode("idna").decode("ascii")
+        resultados = socket.getaddrinfo(host_dns, None, type=socket.SOCK_STREAM)
+        if not resultados:
+            return False, "Hostname não resolveu para nenhum endereço IP"
 
+        ips_resolvidos = set()
+        for resultado in resultados:
+            try:
+                ips_resolvidos.add(resultado[4][0].split("%")[0])
+            except (IndexError, TypeError):
+                return False, "Resposta DNS em formato inesperado"
+
+        if not ips_resolvidos:
+            return False, "Hostname não resolveu para nenhum endereço IP"
+
+        for ip_resolvido in ips_resolvidos:
+            if eh_ip_privado_ou_reservado(ip_resolvido):
+                return False, f"Resolução DNS direciona para IP privado/reservado ({ip_resolvido})"
+        return True, "IP de destino público válido"
+    except (socket.gaierror, UnicodeError, OSError, ValueError):
+        return False, "Falha na resolução ou validação DNS do hostname"
 
 def classificar_score(score: int) -> Tuple[str, str, str]:
     """Retorna a classificação e recomendações alinhadas à escala de 0 a 75."""
@@ -357,62 +373,90 @@ def classificar_score(score: int) -> Tuple[str, str, str]:
 
     return nivel, explicacao, recomendacao
 
-
 def testar_redirecionamento_seguro(url: str, domain_original: str) -> Tuple[int, str, str]:
-    """Verifica redirecionamentos com mitigação de SSRF e limite de saltos."""
-    parsed_atual = urlparse(url)
-    hostname_atual = parsed_atual.hostname or ""
+    """Inspeciona redirecionamentos manualmente, validando cada destino antes do próximo salto."""
+    if not eh_url_valida(url):
+        return 0, "URL inválida; requisição de rede não executada", "URL inválida"
+    
+    url_atual = url
+    saltos = 0
 
-    pode_conectar, motivo_bloqueio = validar_ip_destino(hostname_atual)
-    if not pode_conectar:
-        return 0, f"Análise dinâmica bloqueada preventivamente: {motivo_bloqueio}", "Bloqueado por Proteção SSRF"
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
 
-    try:
-        # Requisição HEAD/GET sem auto-redirecionamento manual seguro
-        class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                return None
+    opener = urllib.request.build_opener(NoRedirectHandler)
 
-        opener = urllib.request.build_opener(NoRedirectHandler)
-        req = urllib.request.Request(url, headers=HEADERS, method='HEAD')
-        
+    while saltos < MAX_REDIRECIONAMENTOS:
+        hostname_atual = urlparse(url_atual).hostname or ""
+        pode_conectar, motivo = validar_ip_destino(hostname_atual)
+        if not pode_conectar:
+            return 0, f"Análise dinâmica bloqueada: {motivo}", "Bloqueado por Proteção SSRF"
+
+        codigo = None
+        location = None
+
         try:
-            with opener.open(req, timeout=HTTP_TIMEOUT_ANALISE) as resposta:
-                url_final = resposta.geturl()
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 308):
-                url_final = e.headers.get('Location', url)
-            else:
-                return 0, "Sem redirecionamento detectado", f"Erro HTTP {e.code}"
+            req = urllib.request.Request(url_atual, headers=HEADERS, method="HEAD")
+            try:
+                with opener.open(req, timeout=HTTP_TIMEOUT_ANALISE) as resposta:
+                    codigo = getattr(resposta, "status", resposta.getcode())
+                    cabecalhos = resposta.headers
+                    location = cabecalhos.get("Location") if cabecalhos else None
+            except urllib.error.HTTPError as e:
+                codigo = e.code
+                location = e.headers.get("Location") if e.headers else None
+                e.close()
 
-        domain_final = urlparse(url_final).hostname or ""
-        
-        if domain_final and not dominios_relacionados(domain_original, domain_final):
-            # Valida destino final antes de reportar
-            valido_final, _ = validar_ip_destino(domain_final)
-            if not valido_final:
-                return 0, "Redirecionamento para IP/Host interno bloqueado", "Bloqueado por SSRF no Redirecionamento"
-            
-            return (
-                PESO_REDIR_EXTERNO,
-                f"Redirecionamento para domínio não relacionado ({domain_final})",
-                "Conexão bem-sucedida"
-            )
+            if codigo in (405, 501):
+                return 0, "Servidor não permite verificação HEAD", f"HTTP {codigo}"
 
-        return 0, "Sem redirecionamento externo", "Conexão bem-sucedida"
+            if codigo not in (301, 302, 303, 307, 308) or not location:
+                return 0, "Sem redirecionamento externo", f"HTTP {codigo if codigo else '200 OK'}"
 
-    except (urllib.error.URLError, TimeoutError, socket.timeout):
-        return 0, "Não foi possível avaliar redirecionamentos (Falha de conexão/Timeout)", "Erro de Conexão"
-    except Exception as e:
-        return 0, "Análise dinâmica não concluída", f"Erro: {type(e).__name__}"
+            destino = urljoin(url_atual, location)
+            if not eh_url_valida(destino):
+                return 0, "Destino de redirecionamento inválido", "Redirecionamento bloqueado"
 
+            dominio_destino = urlparse(destino).hostname or ""
+            valido, motivo_destino = validar_ip_destino(dominio_destino)
+            if not valido:
+                return 0, f"Redirecionamento para destino interno/reservado bloqueado: {motivo_destino}", "Bloqueado por SSRF no redirecionamento"
+
+            if not dominios_relacionados(domain_original, dominio_destino):
+                return PESO_REDIR_EXTERNO, f"Redirecionamento para domínio não relacionado ({dominio_destino})", "Redirecionamento externo detectado"
+
+            url_atual = destino
+            saltos += 1
+
+        except (urllib.error.URLError, TimeoutError, socket.timeout):
+            return 0, "Não foi possível avaliar redirecionamentos (falha de conexão/timeout)", "Erro de conexão/timeout"
+        except (ValueError, UnicodeError):
+            return 0, "URL ou resposta de redirecionamento malformada", "URL inválida"
+        except Exception as e:
+            return 0, "Análise dinâmica não concluída", f"Erro: {type(e).__name__}"
+
+    return 0, f"Limite de {MAX_REDIRECIONAMENTOS} redirecionamentos atingido", "Limite de redirecionamentos"
 
 def analisar_heuristica_url(url: str) -> Dict[str, Any]:
     """Executa a análise dinâmica e atribui pontuação de suspeita à URL sem duplicar indicadores."""
+    if not eh_url_valida(url):
+        nivel, _, _ = classificar_score(0)
+        return {
+            "score": 0,
+            "max_score": MAX_SCORE_POSSIVEL,
+            "nivel": nivel,
+            "explicacao": "A URL não passou pela validação inicial.",
+            "recomendacao": "Informe uma URL HTTP ou HTTPS válida.",
+            "indicadores": ["URL inválida; análise dinâmica não executada."],
+            "status_conexao": "Não verificada",
+            "redirecionamento": "Não verificado",
+        }
+
     pontos_suspeitos = 0
     indicadores = []
     indicadores_fracos = 0
-    
+
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
 
@@ -467,18 +511,17 @@ def analisar_heuristica_url(url: str) -> Dict[str, Any]:
         "redirecionamento": msg_redir
     }
 
-
 # ==============================================================================
 # RELATÓRIO E INTERFACE
 # ==============================================================================
 def exibir_relatorio(
-    url_analisada: str, 
-    feeds_encontrados: List[str], 
+    url_analisada: str,
+    feeds_encontrados: List[str],
     feeds_com_falha: List[str],
     dados_heuristica: Optional[Dict[str, Any]] = None
 ) -> None:
     print("\n" + "=" * 65)
-    print("           🛡️ RELATÓRIO DE ANÁLISE DE SEGURANÇA DA URL (V3.3)")
+    print("           🛡️ RELATÓRIO DE ANÁLISE DE SEGURANÇA DA URL (V3.4)")
     print("=" * 65)
     print(f"📍 URL Analisada      : {url_analisada}")
 
@@ -500,7 +543,7 @@ def exibir_relatorio(
             print(f"📝 Diagnóstico         : {dados_heuristica['explicacao']}")
             print(f"🌐 Status da Conexão   : {dados_heuristica['status_conexao']}")
             print(f"🔄 Redirecionamento    : {dados_heuristica['redirecionamento']}")
-            
+
             print("\n🚩 Indicadores Identificados:")
             if dados_heuristica['indicadores']:
                 for ind in dados_heuristica['indicadores']:
@@ -514,12 +557,11 @@ def exibir_relatorio(
     print("ℹ️ Nota: A ausência nas listas ou pontuação baixa não garante 100% de segurança.")
     print("=" * 65 + "\n")
 
-
 def verificar_url() -> None:
     base_por_feed, feeds_com_falha = carregar_base_de_dados()
 
     print("-" * 65)
-    print("🛡️  SISTEMA HÍBRIDO DE VERIFICAÇÃO DE URLs (V3.3)")
+    print("🛡️  SISTEMA HÍBRIDO DE VERIFICAÇÃO DE URLs (V3.4)")
     print(" (1) Blacklists com Suporte a JSON | (2) Análise Heurística SSRF-Safe")
     print(" Digite 'sair' para encerrar.")
     print("-" * 65)
@@ -551,12 +593,11 @@ def verificar_url() -> None:
             print("🔎 URL ausente das blacklists. Executando análise dinâmica...")
             resultado_heuristico = analisar_heuristica_url(link_normalizado)
             exibir_relatorio(
-                link_usuario, 
-                feeds_encontrados=[], 
-                feeds_com_falha=feeds_com_falha, 
+                link_usuario,
+                feeds_encontrados=[],
+                feeds_com_falha=feeds_com_falha,
                 dados_heuristica=resultado_heuristico
             )
-
 
 if __name__ == "__main__":
     verificar_url()
