@@ -1,4 +1,9 @@
-python/cache/*
-
-#caso queira manter a pasta cache no repositório (exige a criação de um arquivo vazio chamado .gitkeep dentro dela)
+# Cache e arquivos temporários do Python
+/cache/*
 !/cache/.gitkeep
+
+# Diretórios de bytecode e cache do Python
+python/__pycache__/
+python/tests/__pycache__/
+__pycache__/
+*.pyc
